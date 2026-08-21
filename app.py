@@ -7,6 +7,7 @@ import streamlit as st
 import fitz  # PyMuPDF
 import io
 import math
+import re
 from PIL import Image
 
 st.set_page_config(
@@ -169,8 +170,15 @@ def transform_color(r, g, b, config):
     return hsl_to_rgb(h, boosted_s, new_l)
 
 # --- Core Vector PDF Transformation Engine ---
-def convert_pdf_to_dark(doc_bytes, theme_config):
-    doc = fitz.open(stream=doc_bytes, filetype="pdf")
+@st.cache_data
+def convert_pdf_to_dark(doc_bytes, theme_config_tuple):
+    theme_config = dict(theme_config_tuple)
+    try:
+        doc = fitz.open(stream=doc_bytes, filetype="pdf")
+    except Exception as e:
+        st.error(f"Failed to open PDF. It may be corrupt or encrypted. Error: {e}")
+        return None
+        
     bg = theme_config["bg"]
     text_color = theme_config["text"]
 
@@ -186,40 +194,44 @@ def convert_pdf_to_dark(doc_bytes, theme_config):
         # 2. Extract and rewrite page content streams
         # PyMuPDF allows clean stream cleaning
         try:
-            stream_bytes = page.read_contents()
-            if stream_bytes:
-                stream_text = stream_bytes.decode('latin1')
-                
-                # Transform rgb and gray operators
-                import re
-                num_pattern = r'[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?'
-                
-                def replace_rgb(m):
-                    r_str, g_str, b_str, op = m.group(1), m.group(2), m.group(3), m.group(4)
-                    key = f"{r_str},{g_str},{b_str}"
-                    if key not in color_cache:
-                        r, g, b = float(r_str), float(g_str), float(b_str)
-                        nr, ng, nb = transform_color(r, g, b, theme_config)
-                        color_cache[key] = f"{nr:.4f} {ng:.4f} {nb:.4f}"
-                    return f"{color_cache[key]} {op}"
+            page.clean_contents()
+            xrefs = page.get_contents()
+            if xrefs:
+                xref = xrefs[0]
+                stream_bytes = doc.xref_stream(xref)
+                if stream_bytes:
+                    stream_text = stream_bytes.decode('latin1')
+                    
+                    # Transform rgb and gray operators
+                    num_pattern = r'[+-]?(?:\d+(?:\.\d+)?|\.\d+)(?:[eE][+-]?\d+)?'
+                    
+                    def replace_rgb(m):
+                        r_str, g_str, b_str, op = m.group(1), m.group(2), m.group(3), m.group(4)
+                        key = f"{r_str},{g_str},{b_str}"
+                        if key not in color_cache:
+                            r, g, b = float(r_str), float(g_str), float(b_str)
+                            nr, ng, nb = transform_color(r, g, b, theme_config)
+                            color_cache[key] = f"{nr:.4f} {ng:.4f} {nb:.4f}"
+                        return f"{color_cache[key]} {op}"
 
-                rgb_regex = re.compile(rf'({num_pattern})\s+({num_pattern})\s+({num_pattern})\s+(rg|RG)\b')
-                stream_text = rgb_regex.sub(replace_rgb, stream_text)
+                    rgb_regex = re.compile(rf'({num_pattern})\s+({num_pattern})\s+({num_pattern})\s+(rg|RG)\b')
+                    stream_text = rgb_regex.sub(replace_rgb, stream_text)
 
-                def replace_gray(m):
-                    val_str, op = m.group(1), m.group(2)
-                    key = f"g_{val_str}"
-                    if key not in color_cache:
-                        val = float(val_str)
-                        nr, ng, nb = transform_color(val, val, val, theme_config)
-                        color_cache[key] = f"{nr:.4f} {ng:.4f} {nb:.4f}"
-                    target_op = 'rg' if op == 'g' else 'RG'
-                    return f"{color_cache[key]} {target_op}"
+                    def replace_gray(m):
+                        val_str, op = m.group(1), m.group(2)
+                        key = f"g_{val_str}"
+                        if key not in color_cache:
+                            val = float(val_str)
+                            nr, ng, nb = transform_color(val, val, val, theme_config)
+                            color_cache[key] = f"{nr:.4f} {ng:.4f} {nb:.4f}"
+                        target_op = 'rg' if op == 'g' else 'RG'
+                        return f"{color_cache[key]} {target_op}"
 
-                gray_regex = re.compile(rf'({num_pattern})\s+(g|G)\b')
-                stream_text = gray_regex.sub(replace_gray, stream_text)
+                    gray_regex = re.compile(rf'({num_pattern})\s+(g|G)\b')
+                    stream_text = gray_regex.sub(replace_gray, stream_text)
 
-                page.clean_contents()
+                    modified_bytes = stream_text.encode('latin1')
+                    doc.update_stream(xref, modified_bytes)
         except Exception:
             pass
 
@@ -321,18 +333,20 @@ col_btn1, col_btn2 = st.columns([1, 4])
 with col_btn1:
     use_sample = st.button("📄 Try Sample Demo", type="secondary")
 
-active_pdf_bytes = None
-active_file_name = "document.pdf"
+if "active_pdf_bytes" not in st.session_state:
+    st.session_state.active_pdf_bytes = None
+if "active_file_name" not in st.session_state:
+    st.session_state.active_file_name = "document.pdf"
 
 if uploaded_file is not None:
-    active_pdf_bytes = uploaded_file.read()
-    active_file_name = uploaded_file.name
+    st.session_state.active_pdf_bytes = uploaded_file.getvalue()
+    st.session_state.active_file_name = uploaded_file.name
 elif use_sample:
-    active_pdf_bytes = generate_sample_pdf_bytes()
-    active_file_name = "Sample-Report.pdf"
+    st.session_state.active_pdf_bytes = generate_sample_pdf_bytes()
+    st.session_state.active_file_name = "Sample-Report.pdf"
 
-if active_pdf_bytes:
-    total_pages = get_page_count(active_pdf_bytes)
+if st.session_state.active_pdf_bytes:
+    total_pages = get_page_count(st.session_state.active_pdf_bytes)
     
     # Page navigation if multi-page
     selected_page = 0
@@ -341,32 +355,33 @@ if active_pdf_bytes:
     
     # Convert PDF
     with st.spinner("Transforming PDF vector stream..."):
-        converted_bytes = convert_pdf_to_dark(active_pdf_bytes, custom_config)
+        converted_bytes = convert_pdf_to_dark(st.session_state.active_pdf_bytes, tuple(custom_config.items()))
     
-    orig_size_kb = len(active_pdf_bytes) / 1024
-    conv_size_kb = len(converted_bytes) / 1024
-    delta_pct = ((conv_size_kb - orig_size_kb) / orig_size_kb) * 100
-    
-    st.info(f"📊 **File Size**: {orig_size_kb:.1f} KB ➔ **{conv_size_kb:.1f} KB** ({delta_pct:+.1f}% · Zero Bloat) | **{total_pages} {'page' if total_pages == 1 else 'pages'}** | **100% Vector Lossless**")
+    if converted_bytes:
+        orig_size_kb = len(st.session_state.active_pdf_bytes) / 1024
+        conv_size_kb = len(converted_bytes) / 1024
+        delta_pct = ((conv_size_kb - orig_size_kb) / orig_size_kb) * 100 if orig_size_kb else 0
+        
+        st.info(f"📊 **File Size**: {orig_size_kb:.1f} KB ➔ **{conv_size_kb:.1f} KB** ({delta_pct:+.1f}% · Zero Bloat) | **{total_pages} {'page' if total_pages == 1 else 'pages'}** | **100% Vector Lossless**")
 
-    # Side-by-side Visual Comparison
-    col_left, col_right = st.columns(2)
-    with col_left:
-        st.markdown("**Original Light Mode**")
-        orig_img = render_page_image(active_pdf_bytes, page_idx=selected_page)
-        st.image(orig_img, use_container_width=True)
+        # Side-by-side Visual Comparison
+        col_left, col_right = st.columns(2)
+        with col_left:
+            st.markdown("**Original Light Mode**")
+            orig_img = render_page_image(st.session_state.active_pdf_bytes, page_idx=selected_page)
+            st.image(orig_img, use_container_width=True)
 
-    with col_right:
-        st.markdown("**Noir Dark Mode**")
-        dark_img = render_page_image(converted_bytes, page_idx=selected_page)
-        st.image(dark_img, use_container_width=True)
+        with col_right:
+            st.markdown("**Noir Dark Mode**")
+            dark_img = render_page_image(converted_bytes, page_idx=selected_page)
+            st.image(dark_img, use_container_width=True)
 
-    # Primary Download Button
-    out_filename = f"{active_file_name.rsplit('.', 1)[0]}-dark.pdf"
-    st.download_button(
-        label=f"⬇️ Download Dark PDF ({conv_size_kb:.1f} KB)",
-        data=converted_bytes,
-        file_name=out_filename,
-        mime="application/pdf",
-        type="primary"
-    )
+        # Primary Download Button
+        out_filename = f"{st.session_state.active_file_name.rsplit('.', 1)[0]}-dark.pdf"
+        st.download_button(
+            label=f"⬇️ Download Dark PDF ({conv_size_kb:.1f} KB)",
+            data=converted_bytes,
+            file_name=out_filename,
+            mime="application/pdf",
+            type="primary"
+        )
